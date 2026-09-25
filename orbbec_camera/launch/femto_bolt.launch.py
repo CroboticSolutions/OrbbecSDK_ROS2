@@ -10,9 +10,14 @@ import os
 
 
 def generate_launch_description():
+    camera_dds = os.environ.get("CYCLONEDDS_URI", "")
     # Declare arguments
     args = [
         DeclareLaunchArgument("camera_name", default_value="camera"),
+        # Only this camera process gets the override; other ROS nodes keep their environment.
+        DeclareLaunchArgument("camera_dds_config", default_value=camera_dds),
+        DeclareLaunchArgument("early_color_processing", default_value="true"),
+        DeclareLaunchArgument("pipeline_timing_csv_file", default_value=""),
         DeclareLaunchArgument("depth_registration", default_value="false"),
         DeclareLaunchArgument("serial_number", default_value=""),
         DeclareLaunchArgument("usb_port", default_value=""),
@@ -124,7 +129,7 @@ def generate_launch_description():
     ]
 
     # Node configuration
-    parameters = [{arg.name: LaunchConfiguration(arg.name)} for arg in args]
+    parameters = [{arg.name: LaunchConfiguration(arg.name)} for arg in args if arg.name != "camera_dds_config"]
     # get  ROS_DISTRO
     ros_distro = os.environ["ROS_DISTRO"]
     if ros_distro == "foxy":
@@ -137,6 +142,7 @@ def generate_launch_description():
                     name="ob_camera_node",
                     namespace=LaunchConfiguration("camera_name"),
                     parameters=parameters,
+                    additional_env={"CYCLONEDDS_URI": LaunchConfiguration("camera_dds_config")},
                     output="log",
                 )
             ]
@@ -160,6 +166,7 @@ def generate_launch_description():
             composable_node_descriptions=[
                 compose_node,
             ],
+            additional_env={"CYCLONEDDS_URI": LaunchConfiguration("camera_dds_config")},
             output="log",
         )
         # Launch description

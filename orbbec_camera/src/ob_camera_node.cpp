@@ -736,6 +736,13 @@ OBCameraNode::OBCameraNode(rclcpp::Node *node, std::shared_ptr<ob::Device> devic
   setupDefaultImageFormat();
   setupTopics();
 
+  if (!pipeline_timing_csv_file_.empty()) {
+    pipeline_timing_csv_.open(pipeline_timing_csv_file_);
+    if (!pipeline_timing_csv_) {
+      throw std::runtime_error("Cannot open pipeline timing CSV: " + pipeline_timing_csv_file_);
+    }
+    pipeline_timing_csv_ << "stage,index,global_us,sdk_system_us,host_us,start_steady_us,end_steady_us\n";
+  }
   if (enable_frame_drop_log_ || !frame_timestamp_csv_file_.empty()) {
     frame_timestamp_csv_logger_ = std::make_unique<FrameTimestampCsvLogger>(
         enable_frame_drop_log_, frame_timestamp_csv_file_, logger_);
@@ -3805,7 +3812,7 @@ bool OBCameraNode::applyStreamProfiles(const std::vector<PendingStreamProfile> &
 void OBCameraNode::clearColorFrameQueues() {
   {
     std::lock_guard<std::mutex> lock(color_frame_queue_lock_);
-    std::queue<std::shared_ptr<ob::FrameSet>> empty;
+    std::queue<ColorWork> empty;
     std::swap(color_frame_queue_, empty);
   }
   {
@@ -4654,6 +4661,8 @@ void OBCameraNode::getParameters() {
   setAndGetNodeParameter<std::string>(time_domain_, "time_domain", "global");
   time_domain_ = normalizeClosedSetParameterValue(logger_, "time_domain", time_domain_,
                                                   {"global", "device", "system"}, "global");
+  setAndGetNodeParameter<bool>(early_color_processing_, "early_color_processing", false);
+  setAndGetNodeParameter<std::string>(pipeline_timing_csv_file_, "pipeline_timing_csv_file", "");
   setAndGetNodeParameter<bool>(enable_frame_drop_log_, "enable_frame_drop_log", false);
   setAndGetNodeParameter<std::string>(frame_timestamp_csv_file_, "frame_timestamp_csv_file", "");
   setAndGetNodeParameter<std::string>(exposure_range_mode_, "exposure_range_mode", "");
@@ -6079,6 +6088,9 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
   if (frame_set == nullptr) {
     return;
   }
+  const auto sdk_callback_steady_us = getSteadyNowUs();
+  recordPipelineTiming("sdk_callback", frame_set->getFrame(OB_FRAME_COLOR),
+                       sdk_callback_steady_us, sdk_callback_steady_us);
   if (frame_timestamp_csv_logger_ && frame_timestamp_csv_logger_->enabled()) {
     const auto frame_set_arrival_system_us = getSystemNowUs();
     const auto frame_set_arrival_steady_us = getSteadyNowUs();
@@ -6110,6 +6122,21 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
     auto right_color_frame = frame_set->getFrame(OB_FRAME_COLOR_RIGHT);
     auto ir_frame = frame_set->getFrame(OB_FRAME_IR);
     auto depth_frame_for_hw_d2c_undistortion = depth_frame;
+    // Only bypass depth work when it cannot alter RGB geometry and no SDK cloud
+    // needs the aligned pair. Keep the color Frame alive, never share a mutable
+    // FrameSet with the worker. Capture timestamps remain those supplied by SDK.
+    const bool early_color = early_color_processing_ && enable_stream_[COLOR] && color_frame &&
+        !enable_point_cloud_ && !enable_colored_point_cloud_ &&
+        !shouldUseHwD2CColorUndistortion() && !enable_enhanced_depth_.load() &&
+        (!depth_registration_ || align_target_stream_ == OB_STREAM_COLOR);
+    if (early_color) {
+      setColorAutoExposureROI();
+      color_frame = processColorFrameFilter(color_frame);
+      frame_set->pushFrame(color_frame);
+      fps_counter_color_->tick();
+      queueColorFrame(color_frame);
+    }
+    const auto depth_filter_start = getSteadyNowUs();
     if (depth_frame) {
       setDisparitySearchOffset();
       setDepthAutoExposureROI();
@@ -6119,12 +6146,13 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
         fps_counter_depth_->tick();
       }
     }
+    recordPipelineTiming("depth_filter", depth_frame, depth_filter_start, getSteadyNowUs());
     if (shouldUseHwD2CColorUndistortion() && color_frame) {
       applyHwD2CColorUndistortion(frame_set, depth_frame_for_hw_d2c_undistortion);
       depth_frame = frame_set->getFrame(OB_FRAME_DEPTH);
       color_frame = frame_set->getFrame(OB_FRAME_COLOR);
     }
-    if (color_frame) {
+    if (color_frame && !early_color) {
       setColorAutoExposureROI();
       color_frame = processColorFrameFilter(color_frame);
       frame_set->pushFrame(color_frame);
@@ -6189,7 +6217,10 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
           }
         }
         if (align_color_frame) {
-          if (auto new_frame = align_filter_->process(frame_set)) {
+          const auto align_start = getSteadyNowUs();
+          auto new_frame = align_filter_->process(frame_set);
+          recordPipelineTiming("align", color_frame, align_start, getSteadyNowUs());
+          if (new_frame) {
             auto new_frame_set = new_frame->as<ob::FrameSet>();
             CHECK_NOTNULL(new_frame_set.get());
             frame_set = new_frame_set;
@@ -6243,9 +6274,7 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
     }
 
     if (enable_stream_[COLOR] && color_frame) {
-      std::unique_lock<std::mutex> lock(color_frame_queue_lock_);
-      color_frame_queue_.push(frame_set);
-      color_frame_queue_cv_.notify_all();
+      if (!early_color) queueColorFrame(color_frame, frame_set);
     } else {
       publishPointCloud(frame_set);
     }
@@ -6307,6 +6336,32 @@ void OBCameraNode::logFrameInfoOnce(const stream_index_pair &stream_index,
                                   << " Format: " << video_frame->getFormat());
 }
 
+void OBCameraNode::recordPipelineTiming(const char* stage,
+                                      const std::shared_ptr<ob::Frame>& frame,
+                                      int64_t start_us, int64_t end_us) {
+  if (pipeline_timing_csv_file_.empty() || !frame) return;
+  const auto host_us = getSystemNowUs();
+  std::lock_guard<std::mutex> lock(pipeline_timing_mutex_);
+  pipeline_timing_csv_ << stage << ',' << frame->getIndex() << ','
+      << frame->getGlobalTimeStampUs() << ',' << frame->getSystemTimeStampUs() << ','
+      << host_us << ',' << start_us << ',' << end_us << '\n';
+  if (++pipeline_timing_rows_ % 90 == 0) pipeline_timing_csv_.flush();
+}
+
+void OBCameraNode::queueColorFrame(const std::shared_ptr<ob::Frame>& color,
+                                 const std::shared_ptr<ob::FrameSet>& cloud_frames) {
+  std::lock_guard<std::mutex> lock(color_frame_queue_lock_);
+  while (!color_frame_queue_.empty()) {
+    if (frame_timestamp_csv_logger_) {
+      frame_timestamp_csv_logger_->recordImagePublishSkipped(OB_STREAM_COLOR,
+                                                            color_frame_queue_.front().color);
+    }
+    color_frame_queue_.pop();
+  }
+  color_frame_queue_.push({color, cloud_frames, getSteadyNowUs()});
+  color_frame_queue_cv_.notify_one();
+}
+
 void OBCameraNode::onNewColorFrameCallback() {
   while (enable_stream_[COLOR] && rclcpp::ok() && is_running_.load() &&
          !stop_color_frame_threads_.load()) {
@@ -6319,11 +6374,20 @@ void OBCameraNode::onNewColorFrameCallback() {
     if (!rclcpp::ok() || !is_running_.load() || stop_color_frame_threads_.load()) {
       break;
     }
-    std::shared_ptr<ob::FrameSet> frameSet = color_frame_queue_.front();
-    is_color_frame_decoded_ = decodeColorFrameToBuffer(frameSet->colorFrame(), rgb_buffer_);
-    onNewFrameCallback(frameSet->colorFrame(), COLOR);
-    publishPointCloud(frameSet);
+    ColorWork work = color_frame_queue_.front();
     color_frame_queue_.pop();
+    // Keep ownership of this RGB-D pair, but let acquisition replace the next
+    // pending pair while decoding/publishing this one. Buffers remain owned by
+    // this single consumer; stream shutdown joins it before freeing buffers.
+    lock.unlock();
+    const auto decode_start = getSteadyNowUs();
+    recordPipelineTiming("rgb_queue", work.color, work.queued_us, decode_start);
+    is_color_frame_decoded_ = decodeColorFrameToBuffer(work.color, rgb_buffer_);
+    const auto decode_end = getSteadyNowUs();
+    recordPipelineTiming("decode", work.color, decode_start, decode_end);
+    onNewFrameCallback(work.color, COLOR);
+    recordPipelineTiming("rgb_publish", work.color, decode_end, getSteadyNowUs());
+    if (work.cloud_frames) publishPointCloud(work.cloud_frames);
   }
 
   RCLCPP_DEBUG_STREAM(logger_, "Color frame thread exited");

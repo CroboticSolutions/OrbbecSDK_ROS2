@@ -19,6 +19,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -579,6 +580,10 @@ class OBCameraNode {
                        const stream_index_pair& stream_index, const std_msgs::msg::Header& header);
 
   void onNewColorFrameCallback();
+  void queueColorFrame(const std::shared_ptr<ob::Frame>& color,
+                       const std::shared_ptr<ob::FrameSet>& cloud_frames = nullptr);
+  void recordPipelineTiming(const char* stage, const std::shared_ptr<ob::Frame>& frame,
+                            int64_t start_us, int64_t end_us);
 
   void onNewLeftColorFrameCallback();
 
@@ -900,7 +905,12 @@ class OBCameraNode {
   bool is_color_frame_decoded_ = false;
   std::recursive_mutex device_lock_;
   // For color
-  std::queue<std::shared_ptr<ob::FrameSet>> color_frame_queue_;
+  struct ColorWork {
+    std::shared_ptr<ob::Frame> color;
+    std::shared_ptr<ob::FrameSet> cloud_frames;
+    int64_t queued_us;
+  };
+  std::queue<ColorWork> color_frame_queue_;
   std::shared_ptr<std::thread> colorFrameThread_ = nullptr;
   std::atomic_bool stop_color_frame_threads_{false};
   std::mutex color_frame_queue_lock_;
@@ -1008,6 +1018,11 @@ class OBCameraNode {
   int max_depth_limit_ = 0;
   std::string time_domain_ = "global";  // device, system, global
   bool enable_frame_drop_log_ = false;
+  bool early_color_processing_ = false;
+  std::string pipeline_timing_csv_file_;
+  std::ofstream pipeline_timing_csv_;
+  std::mutex pipeline_timing_mutex_;
+  size_t pipeline_timing_rows_ = 0;
   std::string frame_timestamp_csv_file_;
   std::unique_ptr<FrameTimestampCsvLogger> frame_timestamp_csv_logger_;
   std::string exposure_range_mode_;
